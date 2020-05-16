@@ -557,7 +557,6 @@ type Fs struct {
 	ServiceAccountFiles map[string]int
 	waitChangeSvc       sync.Mutex
 	FileObj             *fs.Object
-	LastServiceAccount  string
 	FileName            string
 }
 
@@ -613,6 +612,14 @@ func (f *Fs) Features() *fs.Features {
 
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(err error) (bool, error) {
+	// attempt to type-cast err incase we have context
+	rec, ok := err.(*ErrorWithContext)
+	txServiceAccount := ""
+	if ok {
+		err = rec.err
+		txServiceAccount = rec.ServiceAccountFile
+	}
+
 	if err == nil {
 		return false, nil
 	}
@@ -640,13 +647,13 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 					sac = true
 
 					f.waitChangeSvc.Lock()
-					e = f.changeSvc()
+					e = f.changeSvc(txServiceAccount)
 					f.waitChangeSvc.Unlock()
 				case f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded.":
 					sac = true
 
 					f.waitChangeSvc.Lock()
-					e = f.changeSvc()
+					e = f.changeSvc(txServiceAccount)
 					f.waitChangeSvc.Unlock()
 				default:
 					break
@@ -679,21 +686,16 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 }
 
 // 替换 f.svc 函数
-func (f *Fs) changeSvc() error {
+func (f *Fs) changeSvc(txServiceAccount string) error {
 	opt := &f.opt
 	/**
 	 *  获取sa文件列表
 	 */
 
-	// set temporary last service account file
-	if f.LastServiceAccount == "" {
-		f.LastServiceAccount = opt.ServiceAccountFile
-	}
-
-	lastServiceAccount := opt.ServiceAccountFile
+	currentServiceAccount := opt.ServiceAccountFile
 
 	switch {
-	case opt.ServiceAccountUrl != "" && f.LastServiceAccount == opt.ServiceAccountFile:
+	case opt.ServiceAccountUrl != "" && txServiceAccount == opt.ServiceAccountFile:
 		// rotate based on service account from url
 		payload := map[string]string{
 			"old":    opt.ServiceAccountFile,
@@ -727,7 +729,7 @@ func (f *Fs) changeSvc() error {
 		// we have a service account, set it
 		opt.ServiceAccountFile = sa
 		break
-	case opt.ServiceAccountFilePath != "" && f.LastServiceAccount == opt.ServiceAccountFile:
+	case opt.ServiceAccountFilePath != "" && txServiceAccount == opt.ServiceAccountFile:
 		// default route (rotate from file path)
 		if len(f.ServiceAccountFiles) == 0 {
 			f.ServiceAccountFiles = make(map[string]int)
@@ -790,8 +792,8 @@ func (f *Fs) changeSvc() error {
 		return errors.Wrap(err, "failed to create new drive service")
 	}
 
-	f.LastServiceAccount = lastServiceAccount
-	if f.opt.ServiceAccountFile != lastServiceAccount {
+	if opt.ServiceAccountFile != currentServiceAccount {
+		// service account has rotated
 		fmt.Println("gclone, using sa file:", opt.ServiceAccountFile)
 	}
 
@@ -2250,6 +2252,7 @@ func (f *Fs) Precision() time.Duration {
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
+
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	var srcObj *baseObject
@@ -2284,12 +2287,15 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
+		// store current sa for this tx
+		sa := f.opt.ServiceAccountFile
+
 		info, err = f.svc.Files.Copy(srcObj.id, createInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			KeepRevisionForever(f.opt.KeepRevisionForever).
 			Do()
-		return f.shouldRetry(err)
+		return f.shouldRetry(NewErrorWithContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
