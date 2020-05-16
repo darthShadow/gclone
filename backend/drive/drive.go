@@ -557,6 +557,7 @@ type Fs struct {
 	ServiceAccountFiles map[string]int
 	waitChangeSvc       sync.Mutex
 	FileObj             *fs.Object
+	LastServiceAccount  string
 	FileName            string
 }
 
@@ -615,15 +616,18 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 	if err == nil {
 		return false, nil
 	}
+
 	if fserrors.ShouldRetry(err) {
 		return true, err
 	}
+
 	switch gerr := err.(type) {
 	case *googleapi.Error:
 		if gerr.Code >= 500 && gerr.Code < 600 {
 			// All 5xx errors should be retried
 			return true, err
 		}
+
 		if len(gerr.Errors) > 0 {
 			reason := gerr.Errors[0].Reason
 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
@@ -665,6 +669,9 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 				}
 
 				return true, err
+			} else if f.opt.StopOnUploadLimit && reason == "teamDriveFileLimitExceeded" {
+				fs.Errorf(f, "Received team drive file limit error: %v", err)
+				return false, fserrors.FatalError(err)
 			}
 		}
 	}
@@ -677,9 +684,17 @@ func (f *Fs) changeSvc() error {
 	/**
 	 *  获取sa文件列表
 	 */
+
+	// set temporary last service account file
+	if f.LastServiceAccount == "" {
+		f.LastServiceAccount = opt.ServiceAccountFile
+	}
+
+	lastServiceAccount := opt.ServiceAccountFile
+
 	switch {
-	case opt.ServiceAccountUrl != "":
-		// build payload
+	case opt.ServiceAccountUrl != "" && f.LastServiceAccount == opt.ServiceAccountFile:
+		// rotate based on service account from url
 		payload := map[string]string{
 			"old":    opt.ServiceAccountFile,
 			"remote": f.Name(),
@@ -710,9 +725,9 @@ func (f *Fs) changeSvc() error {
 		// we have a service account, set it
 		opt.ServiceAccountFile = sa
 		break
-	default:
+	case opt.ServiceAccountFilePath != "" && f.LastServiceAccount == opt.ServiceAccountFile:
 		// default route (rotate from file path)
-		if opt.ServiceAccountFilePath != "" && len(f.ServiceAccountFiles) == 0 {
+		if len(f.ServiceAccountFiles) == 0 {
 			f.ServiceAccountFiles = make(map[string]int)
 
 			dirList, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
@@ -748,6 +763,9 @@ func (f *Fs) changeSvc() error {
 
 		// 从库存中删除
 		delete(f.ServiceAccountFiles, opt.ServiceAccountFile)
+		break
+	default:
+		break
 	}
 
 	/**
@@ -770,7 +788,11 @@ func (f *Fs) changeSvc() error {
 		return errors.Wrap(err, "failed to create new drive service")
 	}
 
-	fmt.Println("gclone, using sa file:", opt.ServiceAccountFile)
+	f.LastServiceAccount = lastServiceAccount
+	if f.opt.ServiceAccountFile != lastServiceAccount {
+		fmt.Println("gclone, using sa file:", opt.ServiceAccountFile)
+	}
+
 	return nil
 }
 
