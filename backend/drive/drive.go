@@ -628,22 +628,25 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 			reason := gerr.Errors[0].Reason
 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
 				// 如果存在 ServiceAccountFilePath,调用 changeSvc, 重试
-				if f.opt.ServiceAccountFilePath != "" {
+				var err error
+
+				switch {
+				case f.opt.ServiceAccountFilePath != "":
 					f.waitChangeSvc.Lock()
-					err := f.changeSvc()
+					err = f.changeSvc()
 					f.waitChangeSvc.Unlock()
-					if err == nil {
-						return true, err
-					}
+				case f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded.":
+					f.waitChangeSvc.Lock()
+					err = f.changeSvc()
+					f.waitChangeSvc.Unlock()
+				default:
+					break
 				}
 
-				if f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded." {
-					f.waitChangeSvc.Lock()
-					err := f.changeSvc()
-					f.waitChangeSvc.Unlock()
-					if err == nil {
-						return true, err
-					}
+				if err == nil {
+					return true, err
+				} else {
+					fmt.Println("gclone, service account cycle error:", err)
 				}
 
 				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
@@ -676,11 +679,9 @@ func (f *Fs) changeSvc() error {
 		res, err := rek.Post(opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
 		switch {
 		case err != nil:
-			fmt.Println("request ServiceAccountUrl error:", err)
-			return err
+			return errors.Wrap(err, "request ServiceAccountUrl request error")
 		case res.StatusCode() != 200:
-			fmt.Println("request ServiceAccountUrl bad status:", res.Status())
-			return fmt.Errorf("bad status: %s", res.Status())
+			return fmt.Errorf("request ServiceAccountUrl response status: %s", res.Status())
 		default:
 			break
 		}
@@ -689,28 +690,27 @@ func (f *Fs) changeSvc() error {
 		sa, err := rek.BodyAsString(res.Body())
 		switch {
 		case err != nil:
-			fmt.Println("validate ServiceAccountUrl resp error:", err)
-			return err
+			return errors.Wrap(err, "validate ServiceAccountUrl response")
 		case sa == "":
-			fmt.Println("validate ServiceAccountUrl resp sa failed...")
-			return errors.New("bad sa response")
+			return errors.New("validate ServiceAccountUrl response service account")
 		default:
 			break
 		}
 
 		// we have a service account, set it
 		opt.ServiceAccountFile = sa
-
 		break
 	default:
 		// default route (rotate from file path)
 		if opt.ServiceAccountFilePath != "" && len(f.ServiceAccountFiles) == 0 {
 			f.ServiceAccountFiles = make(map[string]int)
-			dir_list, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
+
+			dirList, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
 			if e != nil {
-				fmt.Println("read ServiceAccountFilePath Files error")
+				return errors.Wrap(e, "read ServiceAccountFilePath files error")
 			}
-			for i, v := range dir_list {
+
+			for i, v := range dirList {
 				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
 				if ".json" == path.Ext(filePath) {
 					//fmt.Println(filePath)
@@ -718,13 +718,16 @@ func (f *Fs) changeSvc() error {
 				}
 			}
 		}
+
 		// 如果读取文件夹后还是0 , 退出
 		if len(f.ServiceAccountFiles) <= 0 {
 			return errors.New("no more service accounts available")
 		}
+
 		/**
 		 *  从sa文件列表 随机取一个，并删除列表中的元素
 		 */
+
 		r := rand.Intn(len(f.ServiceAccountFiles))
 		for k := range f.ServiceAccountFiles {
 			if r == 0 {
@@ -732,6 +735,7 @@ func (f *Fs) changeSvc() error {
 			}
 			r--
 		}
+
 		// 从库存中删除
 		delete(f.ServiceAccountFiles, opt.ServiceAccountFile)
 	}
@@ -739,15 +743,24 @@ func (f *Fs) changeSvc() error {
 	/**
 	 * 创建 client 和 svc
 	 */
-	loadedCreds, _ := ioutil.ReadFile(os.ExpandEnv(opt.ServiceAccountFile))
+	loadedCreds, err := ioutil.ReadFile(os.ExpandEnv(opt.ServiceAccountFile))
+	if err != nil {
+		return errors.Wrap(err, "failed to read service account file")
+	}
+
 	opt.ServiceAccountCredentials = string(loadedCreds)
 	oAuthClient, err := getServiceAccountClient(opt, []byte(opt.ServiceAccountCredentials))
 	if err != nil {
 		return errors.Wrap(err, "failed to create oauth client from service account")
 	}
+
 	f.client = oAuthClient
 	f.svc, err = drive.New(f.client)
-	fmt.Println("gclone sa file:", opt.ServiceAccountFile)
+	if err != nil {
+		return errors.Wrap(err, "failed to create new drive service")
+	}
+
+	fmt.Println("gclone, using sa file:", opt.ServiceAccountFile)
 	return nil
 }
 
