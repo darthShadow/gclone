@@ -706,6 +706,8 @@ func (f *Fs) changeSvc() error {
 		case err != nil:
 			return errors.Wrap(err, "request ServiceAccountUrl request error")
 		case res.StatusCode() != 200:
+			// drain body
+			_, _ = rek.BodyAsBytes(res.Body())
 			return fmt.Errorf("request ServiceAccountUrl response status: %s", res.Status())
 		default:
 			break
