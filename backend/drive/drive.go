@@ -628,27 +628,37 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 			reason := gerr.Errors[0].Reason
 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
 				// 如果存在 ServiceAccountFilePath,调用 changeSvc, 重试
-				var err error
+				var e error
+				sac := false
 
 				switch {
 				case f.opt.ServiceAccountFilePath != "":
+					sac = true
+
 					f.waitChangeSvc.Lock()
-					err = f.changeSvc()
+					e = f.changeSvc()
 					f.waitChangeSvc.Unlock()
 				case f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded.":
+					sac = true
+
 					f.waitChangeSvc.Lock()
-					err = f.changeSvc()
+					e = f.changeSvc()
 					f.waitChangeSvc.Unlock()
 				default:
 					break
 				}
 
-				if err == nil {
-					return true, err
-				} else {
-					fmt.Println("gclone, service account cycle error:", err)
+				// was service-account-file-path or service-account-url logic applied?
+				switch {
+				case sac && e == nil:
+					return true, e
+				case sac:
+					fmt.Println("gclone, service account cycle error:", e)
+				default:
+					break
 				}
 
+				// fallback to standard rclone behavior
 				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
 					fs.Errorf(f, "Received upload limit error: %v", err)
 					return false, fserrors.FatalError(err)
