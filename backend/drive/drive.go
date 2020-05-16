@@ -612,7 +612,7 @@ func (f *Fs) Features() *fs.Features {
 
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(err error) (bool, error) {
-	// attempt to type-cast err incase we have context
+	// attempt to type-cast err in-case we have additional context r.e. retry (service account...)
 	rec, ok := err.(*ErrorWithContext)
 	txServiceAccount := ""
 	if ok {
@@ -2463,13 +2463,16 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// Do the move
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
+		// store current sa for this tx
+		sa := f.opt.ServiceAccountFile
+
 		info, err = f.svc.Files.Update(srcObj.id, dstInfo).
 			RemoveParents(srcParentID).
 			AddParents(dstParents).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(err)
+		return f.shouldRetry(NewErrorWithContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
@@ -3014,13 +3017,16 @@ func (o *baseObject) open(ctx context.Context, url string, options ...fs.OpenOpt
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	if o.v2Download {
+		// store current sa for this tx
+		sa := o.fs.opt.ServiceAccountFile
+
 		var v2File *drive_v2.File
 		err = o.fs.pacer.Call(func() (bool, error) {
 			v2File, err = o.fs.v2Svc.Files.Get(o.id).
 				Fields("downloadUrl").
 				SupportsAllDrives(true).
 				Do()
-			return o.fs.shouldRetry(err)
+			return o.fs.shouldRetry(NewErrorWithContext(err, sa))
 		})
 		if err == nil {
 			fs.Debugf(o, "Using v2 download: %v", v2File.DownloadUrl)
