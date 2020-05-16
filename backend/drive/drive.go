@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/lucperkins/rek"
 	"io"
 	"io/ioutil"
 	"log"
@@ -228,7 +229,10 @@ in with the ID of the root folder.
 		}, {
 			Name: "service_account_file_path",
 			Help: "Service Account Credentials JSON file path .\n",
-		},{
+		}, {
+			Name: "service_account_url",
+			Help: "Service Account Credentials URL to request file path .\n",
+		}, {
 			Name:     "service_account_credentials",
 			Help:     "Service Account Credentials JSON blob\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
 			Hide:     fs.OptionHideConfigurator,
@@ -497,11 +501,12 @@ See: https://github.com/rclone/rclone/issues/3857
 
 // Options defines the configuration for this backend
 type Options struct {
-	Scope                     string               `config:"scope"`
-	RootFolderID              string               `config:"root_folder_id"`
-	ServiceAccountFile        string               `config:"service_account_file"`
+	Scope              string `config:"scope"`
+	RootFolderID       string `config:"root_folder_id"`
+	ServiceAccountFile string `config:"service_account_file"`
 	// 添加一个变量
 	ServiceAccountFilePath    string               `config:"service_account_file_path"`
+	ServiceAccountUrl         string               `config:"service_account_url"`
 	ServiceAccountCredentials string               `config:"service_account_credentials"`
 	TeamDriveID               string               `config:"team_drive"`
 	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
@@ -549,11 +554,10 @@ type Fs struct {
 	importMimeTypes  []string           // MIME types to convert to docs
 	isTeamDrive      bool               // true if this is a team drive
 	//------------------------------------------------------------
-	ServiceAccountFiles    	  map[string]int
-	waitChangeSvc sync.Mutex
-	FileObj *fs.Object
-	FileName string
-
+	ServiceAccountFiles map[string]int
+	waitChangeSvc       sync.Mutex
+	FileObj             *fs.Object
+	FileName            string
 }
 
 type baseObject struct {
@@ -624,16 +628,29 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 			reason := gerr.Errors[0].Reason
 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
 				// 如果存在 ServiceAccountFilePath,调用 changeSvc, 重试
-				if(f.opt.ServiceAccountFilePath != ""){
+				if f.opt.ServiceAccountFilePath != "" {
 					f.waitChangeSvc.Lock()
-					f.changeSvc()
+					err := f.changeSvc()
 					f.waitChangeSvc.Unlock()
-					return true, err
+					if err == nil {
+						return true, err
+					}
 				}
+
+				if f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded." {
+					f.waitChangeSvc.Lock()
+					err := f.changeSvc()
+					f.waitChangeSvc.Unlock()
+					if err == nil {
+						return true, err
+					}
+				}
+
 				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
 					fs.Errorf(f, "Received upload limit error: %v", err)
 					return false, fserrors.FatalError(err)
 				}
+
 				return true, err
 			}
 		}
@@ -642,41 +659,82 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 }
 
 // 替换 f.svc 函数
-func (f *Fs) changeSvc(){
-	opt := &f.opt;
+func (f *Fs) changeSvc() error {
+	opt := &f.opt
 	/**
 	 *  获取sa文件列表
 	 */
-	if(opt.ServiceAccountFilePath != "" && len(f.ServiceAccountFiles) == 0){
-		f.ServiceAccountFiles = make(map[string]int)
-		dir_list, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
-		if e != nil {
-			fmt.Println("read ServiceAccountFilePath Files error")
+	switch {
+	case opt.ServiceAccountUrl != "":
+		// build payload
+		payload := map[string]string{
+			"old":    opt.ServiceAccountFile,
+			"remote": f.Name(),
 		}
-		for i, v := range dir_list {
-			filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
-			if(".json" == path.Ext(filePath)){
-				//fmt.Println(filePath)
-				f.ServiceAccountFiles[filePath] = i
+
+		// send request
+		res, err := rek.Post(opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
+		switch {
+		case err != nil:
+			fmt.Println("request ServiceAccountUrl error:", err)
+			return err
+		case res.StatusCode() != 200:
+			fmt.Println("request ServiceAccountUrl bad status:", res.Status())
+			return fmt.Errorf("bad status: %s", res.Status())
+		default:
+			break
+		}
+
+		// validate response
+		sa, err := rek.BodyAsString(res.Body())
+		switch {
+		case err != nil:
+			fmt.Println("validate ServiceAccountUrl resp error:", err)
+			return err
+		case sa == "":
+			fmt.Println("validate ServiceAccountUrl resp sa failed...")
+			return errors.New("bad sa response")
+		default:
+			break
+		}
+
+		// we have a service account, set it
+		opt.ServiceAccountFile = sa
+
+		break
+	default:
+		// default route (rotate from file path)
+		if opt.ServiceAccountFilePath != "" && len(f.ServiceAccountFiles) == 0 {
+			f.ServiceAccountFiles = make(map[string]int)
+			dir_list, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
+			if e != nil {
+				fmt.Println("read ServiceAccountFilePath Files error")
+			}
+			for i, v := range dir_list {
+				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
+				if ".json" == path.Ext(filePath) {
+					//fmt.Println(filePath)
+					f.ServiceAccountFiles[filePath] = i
+				}
 			}
 		}
-	}
-	// 如果读取文件夹后还是0 , 退出
-	if(len(f.ServiceAccountFiles) <= 0){
-		return ;
-	}
-	/**
-	 *  从sa文件列表 随机取一个，并删除列表中的元素
-	 */
-	r := rand.Intn(len(f.ServiceAccountFiles))
-	for k := range f.ServiceAccountFiles {
-		if r == 0 {
-			opt.ServiceAccountFile = k
+		// 如果读取文件夹后还是0 , 退出
+		if len(f.ServiceAccountFiles) <= 0 {
+			return errors.New("no more service accounts available")
 		}
-		r--
+		/**
+		 *  从sa文件列表 随机取一个，并删除列表中的元素
+		 */
+		r := rand.Intn(len(f.ServiceAccountFiles))
+		for k := range f.ServiceAccountFiles {
+			if r == 0 {
+				opt.ServiceAccountFile = k
+			}
+			r--
+		}
+		// 从库存中删除
+		delete(f.ServiceAccountFiles, opt.ServiceAccountFile)
 	}
-	// 从库存中删除
-	delete(f.ServiceAccountFiles, opt.ServiceAccountFile)
 
 	/**
 	 * 创建 client 和 svc
@@ -685,11 +743,12 @@ func (f *Fs) changeSvc(){
 	opt.ServiceAccountCredentials = string(loadedCreds)
 	oAuthClient, err := getServiceAccountClient(opt, []byte(opt.ServiceAccountCredentials))
 	if err != nil {
-		errors.Wrap(err, "failed to create oauth client from service account")
+		return errors.Wrap(err, "failed to create oauth client from service account")
 	}
 	f.client = oAuthClient
 	f.svc, err = drive.New(f.client)
 	fmt.Println("gclone sa file:", opt.ServiceAccountFile)
+	return nil
 }
 
 // parseParse parses a drive 'url'
@@ -1103,18 +1162,18 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 	//-----------------------------------------------------------
 	maybeIsFile := false
 	// 添加  {id} 作为根目录功能
-	if(path != "" && path[0:1] == "{"){
-		idIndex := strings.Index(path,"}")
-		if(idIndex > 0){
-			RootId := path[1:idIndex];
+	if path != "" && path[0:1] == "{" {
+		idIndex := strings.Index(path, "}")
+		if idIndex > 0 {
+			RootId := path[1:idIndex]
 			name += RootId
 			//opt.ServerSideAcrossConfigs = true
-			if(len(RootId) == 33){
+			if len(RootId) == 33 {
 				maybeIsFile = true
-				opt.RootFolderID = RootId;
-			}else{
-				opt.RootFolderID = RootId;
-				opt.TeamDriveID = RootId;
+				opt.RootFolderID = RootId
+			} else {
+				opt.RootFolderID = RootId
+				opt.TeamDriveID = RootId
 			}
 			path = path[idIndex+1:]
 		}
@@ -1172,7 +1231,6 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 		}
 	}
 
-
 	// set root folder for a team drive or query the user root folder
 	if opt.RootFolderID != "" {
 		// override root folder if set or cached in the config
@@ -1214,11 +1272,11 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 	//------------------------------------------------------
-	if(maybeIsFile){
-		file,err := f.svc.Files.Get(opt.RootFolderID).Fields("name","id","size","mimeType").SupportsAllDrives(true).Do()
-		if err == nil{
+	if maybeIsFile {
+		file, err := f.svc.Files.Get(opt.RootFolderID).Fields("name", "id", "size", "mimeType").SupportsAllDrives(true).Do()
+		if err == nil {
 			//fmt.Println("file.MimeType", file.MimeType)
-			if( "application/vnd.google-apps.folder" != file.MimeType && file.MimeType != ""){
+			if "application/vnd.google-apps.folder" != file.MimeType && file.MimeType != "" {
 				tempF := *f
 				newRoot := ""
 				tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
@@ -1228,7 +1286,7 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 
 				extension, exportName, exportMimeType, isDocument := f.findExportFormat(file)
 				obj, _ := f.newObjectWithExportInfo(file.Name, file, extension, exportName, exportMimeType, isDocument)
-				f.root = "isFile:"+file.Name
+				f.root = "isFile:" + file.Name
 				f.FileObj = &obj
 				return f, fs.ErrorIsFile
 			}
@@ -1409,7 +1467,7 @@ func (f *Fs) newObjectWithExportInfo(
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	//------------------------------------
-	if(f.FileObj != nil){
+	if f.FileObj != nil {
 		return *f.FileObj, nil
 	}
 	//-------------------------------------

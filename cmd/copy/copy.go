@@ -75,7 +75,7 @@ changed recently very efficiently like this:
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
-		if(len(fsrc.Root()) > 7 && "isFile:" == fsrc.Root()[0:7]){
+		if len(fsrc.Root()) > 7 && "isFile:" == fsrc.Root()[0:7] {
 			srcFileName = fsrc.Root()[7:]
 		}
 		cmd.Run(true, true, command, func() error {
