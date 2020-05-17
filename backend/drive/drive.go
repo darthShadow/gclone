@@ -653,57 +653,94 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 
 		if len(gerr.Errors) > 0 {
 			reason := gerr.Errors[0].Reason
-			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
-				// 如果存在 ServiceAccountFilePath,调用 changeSvc, 重试
-				var e error
-				sac := false
-
-				switch {
-				case f.opt.ServiceAccountFilePath != "":
-					sac = true
-
-					f.waitChangeSvc.Lock()
-					e = f.changeSvc(txServiceAccount)
-					f.waitChangeSvc.Unlock()
-				case f.opt.ServiceAccountUrl != "" && gerr.Errors[0].Message == "User rate limit exceeded.":
-					sac = true
-
-					f.waitChangeSvc.Lock()
-					e = f.changeSvc(txServiceAccount)
-					f.waitChangeSvc.Unlock()
-				default:
-					break
-				}
-
-				// was service-account-file-path or service-account-url logic applied?
-				switch {
-				case sac && e == nil:
-					return true, e
-				case sac:
-					fmt.Println("gclone, service account cycle error:", e)
-				default:
-					break
-				}
-
-				// fallback to standard rclone behavior
-				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
-					fs.Errorf(f, "Received upload limit error: %v", err)
-					return false, fserrors.FatalError(err)
-				}
-
-				return true, err
-			} else if f.opt.StopOnDownloadLimit && reason == "downloadQuotaExceeded" {
-				// Message = "The download quota for this file has been exceeded."
-				// TODO: Add service account rotation
-				fs.Errorf(f, "Received download limit error: %v", err)
-				return false, fserrors.FatalError(err)
-			} else if f.opt.StopOnUploadLimit && reason == "teamDriveFileLimitExceeded" {
-				fs.Errorf(f, "Received team drive file limit error: %v", err)
-				return false, fserrors.FatalError(err)
-			}
+			msg := gerr.Errors[0].Message
+			return f.handleCycleError(err, reason, msg, txServiceAccount)
 		}
 	}
 	return false, err
+}
+
+func (f *Fs) handleCycleError(origError error, reason string, message string, txFailedServiceAccount string) (bool, error) {
+	var e error
+	sac := false
+
+	// handle error accordingly
+	switch {
+	case reason == "rateLimitExceeded", reason == "userRateLimitExceeded":
+		// rate limit exceeded
+		if message == "User rate limit exceeded." {
+			switch {
+			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+				sac = true
+
+				f.waitChangeSvc.Lock()
+				e = f.changeSvc(txFailedServiceAccount)
+				f.waitChangeSvc.Unlock()
+			default:
+				break
+			}
+
+			// was service-account-file-path or service-account-url logic applied?
+			switch {
+			case sac && e == nil:
+				return true, e
+			case sac:
+				fmt.Println("gclone, service account cycle error:", e)
+			default:
+				break
+			}
+
+			// - standard rclone behavior
+			if f.opt.StopOnUploadLimit {
+				fs.Errorf(f, "Received upload limit error: %v", origError)
+				return false, fserrors.FatalError(origError)
+			}
+		}
+
+		return true, origError
+	case reason == "downloadQuotaExceeded":
+		// download quota exceeded
+		if message == "The download quota for this file has been exceeded." {
+			switch {
+			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+				sac = true
+
+				f.waitChangeSvc.Lock()
+				e = f.changeSvc(txFailedServiceAccount)
+				f.waitChangeSvc.Unlock()
+			default:
+				break
+			}
+
+			// was service-account-file-path or service-account-url logic applied?
+			switch {
+			case sac && e == nil:
+				return true, e
+			case sac:
+				fmt.Println("gclone, service account cycle error:", e)
+			default:
+				break
+			}
+		}
+
+		// - standard rclone behavior
+		if f.opt.StopOnDownloadLimit {
+			fs.Errorf(f, "Received download limit error: %v", origError)
+			return false, fserrors.FatalError(origError)
+		}
+
+	case reason == "teamDriveFileLimitExceeded":
+		// teamdrive file limit exceeded
+		// - standard rclone behavior
+		if f.opt.StopOnUploadLimit {
+			fs.Errorf(f, "Received team drive file limit error: %v", origError)
+			return false, fserrors.FatalError(origError)
+		}
+	default:
+		break
+	}
+
+	return false, origError
 }
 
 // 替换 f.svc 函数
