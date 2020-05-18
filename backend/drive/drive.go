@@ -698,29 +698,28 @@ func (f *Fs) handleCycleError(origError error, reason string, message string, tx
 		}
 
 		return true, origError
+
 	case reason == "downloadQuotaExceeded":
 		// download quota exceeded
-		if message == "The download quota for this file has been exceeded." {
-			switch {
-			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
-				sac = true
+		switch {
+		case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+			sac = true
 
-				f.waitChangeSvc.Lock()
-				e = f.changeSvc(txFailedServiceAccount)
-				f.waitChangeSvc.Unlock()
-			default:
-				break
-			}
+			f.waitChangeSvc.Lock()
+			e = f.changeSvc(txFailedServiceAccount)
+			f.waitChangeSvc.Unlock()
+		default:
+			break
+		}
 
-			// was service-account-file-path or service-account-url logic applied?
-			switch {
-			case sac && e == nil:
-				return true, e
-			case sac:
-				fmt.Println("gclone, service account cycle error:", e)
-			default:
-				break
-			}
+		// was service-account-file-path or service-account-url logic applied?
+		switch {
+		case sac && e == nil:
+			return true, e
+		case sac:
+			fmt.Println("gclone, service account cycle error:", e)
+		default:
+			break
 		}
 
 		// - standard rclone behavior
